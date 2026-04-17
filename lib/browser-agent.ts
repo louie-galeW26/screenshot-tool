@@ -232,19 +232,22 @@ async function captureElementScreenshot(
   // Try to find the element with a timeout
   await element.waitFor({ state: "visible", timeout: 3000 });
 
-  // Walk up to a meaningful container — prefer tight containers that hold just the relevant content.
+  // Walk up to a meaningful container
   const containerSelector = await element.evaluate((el: Element) => {
     let current = el.parentElement;
+    const containerTags = ["SECTION", "ARTICLE", "MAIN"];
     let bestContainer: Element = el;
-    const startHeight = (el as HTMLElement).offsetHeight || 0;
 
-    // Walk up until we find a reasonably sized container OR we start blowing up in size
-    for (let i = 0; i < 6 && current; i++) {
-      const h = (current as HTMLElement).offsetHeight || 0;
-      // Stop if container gets too tall — we've gone past the relevant content
-      if (h > 800) break;
-      // Prefer containers that are meaningfully larger than the starting element
-      if (h >= Math.max(startHeight + 40, 80) && h <= 800) {
+    for (let i = 0; i < 10 && current; i++) {
+      if (containerTags.includes(current.tagName)) {
+        bestContainer = current;
+        break;
+      }
+      if (
+        current.tagName === "DIV" &&
+        (current as HTMLElement).offsetHeight >= 50 &&
+        (current as HTMLElement).offsetHeight <= 1200
+      ) {
         bestContainer = current;
       }
       current = current.parentElement;
@@ -402,28 +405,56 @@ export async function browseForContent(
         `Found ${analysis.relevantSections.length} relevant sections on this page`
       );
 
-      // Capture each relevant section
+      // Capture each relevant section. If element capture fails, keep the finding
+      // with a viewport-region fallback so we don't lose Claude's extracted text.
+      const pageTitle = await page.title();
       for (const section of analysis.relevantSections) {
         if (findings.length >= MAX_FINDINGS) break;
 
-        try {
-          const { screenshotBuffer, extractedText } =
-            await captureElementScreenshot(page, section);
+        let screenshotBuffer: Buffer;
+        let extractedText = section.extractedText;
 
-          findings.push({
-            pageUrl: next.url,
-            pageTitle: await page.title(),
-            sectionHeading: section.description,
-            extractedText: extractedText || section.extractedText,
-            screenshotBuffer,
-            relevanceScore: section.relevanceScore,
-          });
+        try {
+          const result = await captureElementScreenshot(page, section);
+          screenshotBuffer = result.screenshotBuffer;
+          extractedText = result.extractedText || section.extractedText;
         } catch (e) {
+          // Fallback: viewport screenshot at the current scroll position.
+          // Scroll to the text first if possible.
           const msg = e instanceof Error ? e.message : String(e);
           errors.push(
-            `Could not capture "${section.description}" on ${next.url}: ${msg}`
+            `Element locator failed for "${section.description}" on ${next.url} (${msg}); using fallback screenshot`
+          );
+
+          try {
+            // Try to scroll the approximate text into view
+            await page.evaluate((text) => {
+              const all = Array.from(document.body.querySelectorAll("*"));
+              const match = all.find(
+                (el) =>
+                  el.childNodes.length > 0 &&
+                  (el as HTMLElement).innerText?.includes(text.slice(0, 30))
+              );
+              if (match) {
+                match.scrollIntoView({ block: "center", behavior: "instant" as ScrollBehavior });
+              }
+            }, section.locatorValue);
+            await page.waitForTimeout(300);
+          } catch {}
+
+          screenshotBuffer = Buffer.from(
+            await page.screenshot({ fullPage: false, type: "png" })
           );
         }
+
+        findings.push({
+          pageUrl: next.url,
+          pageTitle,
+          sectionHeading: section.description,
+          extractedText,
+          screenshotBuffer,
+          relevanceScore: section.relevanceScore,
+        });
       }
 
       // Queue new links (same-domain only)
